@@ -1,0 +1,6 @@
+,Pred_KIRC,Pred_LUAD,Pred_LUSC,Pred_PRAD,Pred_THCA
+True_KIRC,105,0,0,0,0
+True_LUAD,0,98,4,0,0
+True_LUSC,0,9,91,0,0
+True_PRAD,0,0,0,99,0
+True_THCA,0,0,0,0,100

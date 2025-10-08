@@ -15,10 +15,11 @@
 # NOTE: This script is optimized for memory. For very wide matrices (many genes), set MAX_FEATURES to a safe cap.
 #       For XGBoost/LightGBM/CatBoost you need those packages installed in your environment.
 
-import os
+import gc
 import re
 import json
 import math
+import time
 import warnings
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
@@ -63,23 +64,48 @@ except Exception:
 
 
 # -------------------- CONFIG --------------------
+# All runtime controls live here so we can tune behaviour quickly when the notebook
+# ends up on a constrained machine. Values intentionally conservative to prevent
+# memory spikes while still matching the assignment deliverables.
 RANDOM_STATE = 42
 CANCER_SET = {"KIRC","LUAD","LUSC","PRAD","THCA"}
 PATIENT_ID_TO_PLOT = "TCGA-39-5011-01A"
-CANCER_CSV = "lncRNA_5_Cancers.csv"        # Put the file alongside this script/notebook or change to absolute path
-GDSC2_CSV   = "GDSC2_13drugs.csv"          # Provide locally (download from the course Module 2 / link)
+CANCER_CSV = Path("lncRNA_5_Cancers.csv")        # Primary lookup
+CANCER_FALLBACK = Path("data/raw/lncRNA_5_Cancers.csv")
+GDSC2_CSV   = Path("GDSC2_13drugs.csv")          # Provide locally (download from the course Module 2 / link)
+GDSC2_FALLBACK = Path("data/raw/hw3-drug-screening-data.csv")
 OUT_DIR = Path("hw3_outputs")               # Created if missing
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Memory safety knobs
-MAX_FEATURES_CLASSIF = 4000   # cap feature count (columns) to avoid OOM on laptops
-MAX_FEATURES_REGRESS = 4000
-SHAP_SAMPLES_PER_CLASS = 50   # number of rows per cancer for SHAP mean|SHAP| aggregation (Task 2a)
-SHAP_SAMPLES_REG = 200        # number of rows for regressor SHAP aggregation (Task 4a)
+# - We cap feature counts aggressively because SHAP scales linearly with column count.
+# - SHAP sampling is also trimmed; the notebook will mention that we can loosen caps
+#   once we move to a beefier machine.
+MAX_FEATURES_CLASSIF = 1000   # cap feature count (columns) to avoid OOM on laptops
+MAX_FEATURES_REGRESS = 1200
+SHAP_SAMPLES_PER_CLASS = 30   # number of rows per cancer for SHAP mean|SHAP| aggregation (Task 2a)
+SHAP_SAMPLES_REG = 100        # number of rows for regressor SHAP aggregation (Task 4a)
+
+
+def log(message: str) -> None:
+    """Small logging helper so every stage is timestamped in notebook + CLI."""
+    stamp = time.strftime("%H:%M:%S")
+    print(f"[{stamp}] {message}")
+
+
+def resolve_data_path(primary: Path, fallback: Optional[Path]) -> Optional[Path]:
+    """Return the first existing path among the provided data locations."""
+    for candidate in (primary, fallback):
+        if candidate is None:
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return candidate_path
+    return None
 
 # -------------------- UTILITIES --------------------
 def detect_id_and_target(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    """Detect a TCGA-like ID column and a 5-class cancer target column from a small sample."""
+    """Detect a TCGA-like ID column and the five-class cancer target from a quick sample."""
     id_col = None
     target_col = None
     for c in df.select_dtypes(include=['object']).columns:
@@ -105,9 +131,19 @@ def detect_id_and_target(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]
     return id_col, target_col
 
 
+def select_top_variance_features(X: pd.DataFrame, max_features: int) -> pd.DataFrame:
+    """Keep the highest-variance features so SHAP and tree models remain tractable."""
+    if X.shape[1] <= max_features:
+        return X
+    variances = X.var(axis=0, skipna=True)
+    top_cols = variances.nlargest(max_features).index
+    return X.loc[:, top_cols]
+
+
 def memory_savvy_read_cancers(csv_path: str, max_features: int) -> Tuple[pd.DataFrame, pd.Series, Optional[pd.Series], str, Optional[str]]:
     """Read only header and a tiny sample to detect id/target; then load a capped subset of features."""
     header_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    # Peek only at a small window to infer meta columns without materializing the whole matrix.
     sample_df = pd.read_csv(csv_path, nrows=200)
     id_col, target_col = detect_id_and_target(sample_df)
     if target_col is None:
@@ -131,6 +167,8 @@ def memory_savvy_read_cancers(csv_path: str, max_features: int) -> Tuple[pd.Data
         X[c] = pd.to_numeric(X[c], errors="coerce")
     X = X.astype(np.float32)
     X = X.loc[:, X.notna().any(axis=0)]
+    X = select_top_variance_features(X, max_features)
+    X = select_top_variance_features(X, max_features)
     return X, y, ids, target_col, id_col
 
 
@@ -147,11 +185,14 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
         Mapping from encoded integer labels back to original class names.
     """
 
+    # XGBoost requires integer-coded targets, while the PDF supplies string labels.
+    # We keep both versions around: encoded ints for training, human-readable strings for metrics.
     class_names = sorted(y.astype(str).unique())
     class_to_idx = {c: i for i, c in enumerate(class_names)}
     idx_to_class = {i: c for c, i in class_to_idx.items()}
     y_encoded = y.map(class_to_idx).astype(int)
 
+    # Train/validation split keeps stratification so every cancer type remains represented.
     X_train, X_test, y_train_enc, y_test_enc, y_train_lbl, y_test_lbl = train_test_split(
         X,
         y_encoded,
@@ -164,6 +205,7 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
     preprocess = ColumnTransformer([("num", SimpleImputer(strategy="median"), X.columns)], remainder="drop")
     models = {}
 
+    # Baselines: classical tree ensemble family plus optional gradient-boosted variants.
     models["DecisionTree"] = Pipeline([
         ("prep", preprocess),
         ("clf", DecisionTreeClassifier(random_state=random_state, min_samples_leaf=2, class_weight="balanced"))
@@ -171,12 +213,28 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
 
     models["RandomForest"] = Pipeline([
         ("prep", preprocess),
-        ("clf", RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1, class_weight="balanced_subsample"))
+            (
+                "clf",
+                RandomForestClassifier(
+                n_estimators=120,
+                random_state=random_state,
+                n_jobs=-1,
+                class_weight="balanced_subsample",
+            ),
+        ),
     ])
 
     models["GBM"] = Pipeline([
         ("prep", preprocess),
-        ("clf", GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=random_state))
+        (
+            "clf",
+            GradientBoostingClassifier(
+                n_estimators=120,
+                learning_rate=0.05,
+                max_depth=3,
+                random_state=random_state,
+            ),
+        ),
     ])
 
     if HAVE_XGB:
@@ -184,7 +242,7 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
             ("prep", preprocess),
             ("clf", XGBClassifier(
                 objective="multi:softprob", eval_metric="mlogloss",
-                n_estimators=500, learning_rate=0.05, max_depth=6,
+                n_estimators=160, learning_rate=0.05, max_depth=6,
                 subsample=0.8, colsample_bytree=0.8, tree_method="hist", n_jobs=-1, random_state=random_state
             ))
         ])
@@ -192,18 +250,30 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
     if HAVE_LGBM:
         models["LightGBM"] = Pipeline([
             ("prep", preprocess),
-            ("clf", LGBMClassifier(n_estimators=700, learning_rate=0.05, num_leaves=63, subsample=0.8, colsample_bytree=0.8, random_state=random_state))
+            (
+                "clf",
+                LGBMClassifier(
+                    n_estimators=160,
+                    learning_rate=0.05,
+                    num_leaves=63,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=random_state,
+                    verbosity=-1,
+                ),
+            )
         ])
 
     if HAVE_CAT:
         models["CatBoost"] = Pipeline([
             ("prep", preprocess),
-            ("clf", CatBoostClassifier(iterations=600, learning_rate=0.05, depth=6, loss_function="MultiClass", random_seed=random_state, verbose=False))
+            ("clf", CatBoostClassifier(iterations=160, learning_rate=0.05, depth=6, loss_function="MultiClass", random_seed=random_state, verbose=False))
         ])
 
     rows = []
     fitted = {}
     for name, pipe in models.items():
+        log(f"[Task 1] Training classifier: {name}")
         pipe.fit(X_train, y_train_enc)
         y_pred_enc = pipe.predict(X_test)
         y_pred_enc = np.asarray(y_pred_enc, dtype=int)
@@ -212,6 +282,9 @@ def train_compare_classifiers(X: pd.DataFrame, y: pd.Series, random_state=RANDOM
         f1m = f1_score(y_test_lbl, y_pred, average="macro")
         rows.append({"Model": name, "Test_Accuracy": acc, "Test_F1_Macro": f1m})
         fitted[name] = pipe
+
+        # Release intermediate tree structures before moving to the next model to keep memory tidy.
+        gc.collect()
 
     res = pd.DataFrame(rows).sort_values(by=["Test_F1_Macro","Test_Accuracy"], ascending=False).reset_index(drop=True)
 
@@ -254,13 +327,17 @@ def shap_task2(
     patient_id: str,
     idx_to_class: Optional[Dict[int, str]] = None,
 ):
+    """Compute the two SHAP analyses required for Tasks 2a–2b with guardrails for runtime."""
     if not HAVE_SHAP:
         print("SHAP not available — install `shap` to run Task 2.")
         return
+
+    log("[Task 2] Preparing TreeExplainer for best classifier")
     estimator = best_model.named_steps[list(best_model.named_steps.keys())[-1]]
-    explainer = shap.TreeExplainer(estimator)
+    explainer = shap.TreeExplainer(estimator, feature_perturbation="tree_path_dependent")
 
     # (a) Top-10 per cancer
+    log("[Task 2a] Sampling compact subset across cancer types for SHAP aggregation")
     df_full = X.copy()
     df_full["__y__"] = y.values
     idxs = []
@@ -274,22 +351,32 @@ def shap_task2(
     X_shap = X.loc[idxs]
     y_shap = y.loc[idxs]
 
-    shap_values = explainer.shap_values(X_shap)
-    records = []
-    if isinstance(shap_values, list):
-        classes = list(estimator.classes_)
-        for i, raw_cls in enumerate(classes):
-            cls_name = idx_to_class.get(int(raw_cls), str(raw_cls)) if idx_to_class else str(raw_cls)
-            vals = shap_values[i]
-            mean_abs = np.abs(vals).mean(axis=0)
-            top_idx = np.argsort(mean_abs)[::-1][:10]
-            for rank, j in enumerate(top_idx, start=1):
-                records.append({"CancerType": str(cls_name), "Rank": rank, "Feature": X_shap.columns[j], "Mean|SHAP|": float(mean_abs[j])})
+    shap_raw = explainer.shap_values(X_shap)
+
+    if isinstance(shap_raw, list):
+        shap_by_class = shap_raw
     else:
-        mean_abs = np.abs(shap_values).mean(axis=0)
+        shap_array = np.asarray(shap_raw)
+        if shap_array.ndim == 3:  # (n_samples, n_features, n_classes)
+            shap_by_class = [shap_array[:, :, i] for i in range(shap_array.shape[2])]
+        else:  # treat as single output
+            shap_by_class = [shap_array]
+
+    records = []
+    classes = list(estimator.classes_) if hasattr(estimator, "classes_") else list(range(len(shap_by_class)))
+    for i, raw_cls in enumerate(classes):
+        cls_name = idx_to_class.get(int(raw_cls), str(raw_cls)) if idx_to_class else str(raw_cls)
+        vals = shap_by_class[i]
+        # Mean absolute SHAP answers “how strongly does this gene push predictions for this class?”
+        mean_abs = np.abs(vals).mean(axis=0)
         top_idx = np.argsort(mean_abs)[::-1][:10]
         for rank, j in enumerate(top_idx, start=1):
-            records.append({"CancerType": "ALL", "Rank": rank, "Feature": X_shap.columns[j], "Mean|SHAP|": float(mean_abs[j])})
+            records.append({
+                "CancerType": str(cls_name),
+                "Rank": rank,
+                "Feature": X_shap.columns[j],
+                "Mean|SHAP|": float(np.asarray(mean_abs[j]).reshape(-1)[0]),
+            })
     pd.DataFrame(records).to_csv(OUT_DIR/"task2a_top10_features_per_cancer.csv", index=False)
 
     # (b) Force plots for patient across 5 cancer types
@@ -303,7 +390,19 @@ def shap_task2(
     else:
         idx = X.index[0]
     x_row = X.loc[[idx]]
-    shap_row = explainer.shap_values(x_row)
+    log(f"[Task 2b] Generating force plots for patient {patient_id} (row idx {idx})")
+    shap_row_raw = explainer.shap_values(x_row)
+
+    if isinstance(shap_row_raw, list):
+        shap_row_list = shap_row_raw
+    else:
+        shap_row_arr = np.asarray(shap_row_raw)
+        if shap_row_arr.ndim == 3:  # (n_samples, n_features, n_classes)
+            shap_row_list = [shap_row_arr[:, :, i] for i in range(shap_row_arr.shape[2])]
+        elif shap_row_arr.ndim == 2:
+            shap_row_list = [shap_row_arr]
+        else:
+            shap_row_list = [shap_row_arr.reshape(shap_row_arr.shape[0], -1)]
 
     def save_force_html(path, force_obj):
         try:
@@ -312,7 +411,7 @@ def shap_task2(
         except Exception:
             return False
 
-    if isinstance(shap_row, list):
+    if isinstance(shap_row_list, list) and len(shap_row_list) > 1:
         classes = list(estimator.classes_)
         for i, raw_cls in enumerate(classes):
             cls_name = idx_to_class.get(int(raw_cls), str(raw_cls)) if idx_to_class else str(raw_cls)
@@ -321,11 +420,16 @@ def shap_task2(
                 expected = expected_values[i]
             else:
                 expected = expected_values
-            force = shap.force_plot(expected, shap_row[i][0, :], x_row, feature_names=x_row.columns, matplotlib=False)
+            force = shap.force_plot(expected, shap_row_list[i][0, :], x_row, feature_names=x_row.columns, matplotlib=False)
             save_force_html(OUT_DIR/f"task2b_forceplot_{cls_name}_patient_{patient_id.replace(':','-')}.html", force)
     else:
         expected = explainer.expected_value
-        force = shap.force_plot(expected, shap_row[0, :], x_row, feature_names=x_row.columns, matplotlib=False)
+        single = shap_row_list[0]
+        if single.ndim == 1:
+            row_vals = single
+        else:
+            row_vals = single[0, :]
+        force = shap.force_plot(expected, row_vals, x_row, feature_names=x_row.columns, matplotlib=False)
         save_force_html(OUT_DIR/f"task2b_forceplot_patient_{patient_id.replace(':','-')}.html", force)
 
 
@@ -340,11 +444,11 @@ def memory_savvy_read_gdsc2(csv_path: str, max_features: int) -> Tuple[pd.DataFr
     # Heuristics for key/target columns:
     target_col = "LN_IC50"
     id_cols = []
-    for cand in ["cell_line","CELL_LINE","CellLine","cellLine","cell_line_name"]:
+    for cand in ["CELL_LINE_NAME","cell_line","CELL_LINE","CellLine","cellLine","cell_line_name"]:
         if cand in header_cols:
             id_cols.append(cand)
             break
-    for cand in ["drug_name","Drug","DRUG","drug"]:
+    for cand in ["DRUG_NAME","drug_name","Drug","DRUG","drug"]:
         if cand in header_cols:
             id_cols.append(cand)
             break
@@ -363,6 +467,7 @@ def memory_savvy_read_gdsc2(csv_path: str, max_features: int) -> Tuple[pd.DataFr
         X[c] = pd.to_numeric(X[c], errors="coerce")
     X = X.astype(np.float32)
     X = X.loc[:, X.notna().any(axis=0)]
+    X = select_top_variance_features(X, max_features)
     meta = {"n_rows": int(len(df)), "n_features": int(X.shape[1]), "id_cols": id_cols, "target": target_col}
     return X, y, keys, meta
 
@@ -373,19 +478,79 @@ def train_compare_regressors(X: pd.DataFrame, y: pd.Series, random_state=RANDOM_
 
     models = {}
     models["DecisionTreeReg"] = Pipeline([("prep", preprocess), ("reg", DecisionTreeRegressor(random_state=random_state, min_samples_leaf=2))])
-    models["RandomForestReg"] = Pipeline([("prep", preprocess), ("reg", RandomForestRegressor(n_estimators=300, random_state=random_state, n_jobs=-1))])
-    models["GBMReg"] = Pipeline([("prep", preprocess), ("reg", GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=random_state))])
+    models["RandomForestReg"] = Pipeline([
+        ("prep", preprocess),
+        ("reg", RandomForestRegressor(n_estimators=120, random_state=random_state, n_jobs=-1)),
+    ])
+    models["GBMReg"] = Pipeline([
+        ("prep", preprocess),
+        (
+            "reg",
+            GradientBoostingRegressor(
+                n_estimators=120,
+                learning_rate=0.05,
+                max_depth=3,
+                random_state=random_state,
+            ),
+        ),
+    ])
 
     if HAVE_XGB:
-        models["XGBReg"] = Pipeline([("prep", preprocess), ("reg", XGBRegressor(n_estimators=600, learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=0.8, tree_method="hist", n_jobs=-1, random_state=random_state))])
+        models["XGBReg"] = Pipeline([
+            ("prep", preprocess),
+            (
+                "reg",
+                XGBRegressor(
+                    n_estimators=160,
+                    learning_rate=0.05,
+                    max_depth=6,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    tree_method="hist",
+                    n_jobs=-1,
+                    random_state=random_state,
+                ),
+            ),
+        ])
     if HAVE_LGBM:
-        models["LGBMReg"] = Pipeline([("prep", preprocess), ("reg", LGBMRegressor(n_estimators=800, learning_rate=0.05, num_leaves=63, subsample=0.8, colsample_bytree=0.8, random_state=random_state))])
+        models["LGBMReg"] = Pipeline([
+            (
+                "prep",
+                preprocess,
+            ),
+            (
+                "reg",
+                LGBMRegressor(
+                    n_estimators=160,
+                    learning_rate=0.05,
+                    num_leaves=63,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=random_state,
+                    verbosity=-1,
+                ),
+            ),
+        ])
     if HAVE_CAT:
-        models["CatBoostReg"] = Pipeline([("prep", preprocess), ("reg", CatBoostRegressor(iterations=700, learning_rate=0.05, depth=6, loss_function="RMSE", random_seed=random_state, verbose=False))])
+        models["CatBoostReg"] = Pipeline([
+            ("prep", preprocess),
+            (
+                "reg",
+                CatBoostRegressor(
+                    iterations=160,
+                    learning_rate=0.05,
+                    depth=6,
+                    loss_function="RMSE",
+                    random_seed=random_state,
+                    verbose=False,
+                ),
+            ),
+        ])
 
     rows = []
     fitted = {}
     for name, pipe in models.items():
+        log(f"[Task 3] Training regressor: {name}")
         pipe.fit(X_train, y_train)
         pred = pipe.predict(X_test)
         mae = mean_absolute_error(y_test, pred)
@@ -394,6 +559,7 @@ def train_compare_regressors(X: pd.DataFrame, y: pd.Series, random_state=RANDOM_
         r2 = r2_score(y_test, pred)
         rows.append({"Model": name, "MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2})
         fitted[name] = pipe
+        gc.collect()
 
     res = pd.DataFrame(rows).sort_values(by=["RMSE","MAE"], ascending=[True, True]).reset_index(drop=True)
     res.to_csv(OUT_DIR/"task3_regressor_comparison.csv", index=False)
@@ -410,8 +576,9 @@ def shap_task4(best_reg_model: Pipeline, X: pd.DataFrame, y: pd.Series, keys: pd
         print("SHAP not available — install `shap` to run Task 4.")
         return
 
+    log("[Task 4] Building TreeExplainer for best regressor")
     est = best_reg_model.named_steps[list(best_reg_model.named_steps.keys())[-1]]
-    explainer = shap.TreeExplainer(est)
+    explainer = shap.TreeExplainer(est, feature_perturbation="tree_path_dependent")
 
     # (a) per-drug top-10 features (requires a 'drug' component in key: cell|drug)
     # Parse drug names if keys are "cell|drug"
@@ -440,10 +607,16 @@ def shap_task4(best_reg_model: Pipeline, X: pd.DataFrame, y: pd.Series, keys: pd
         mean_abs = np.abs(shap_vals[mask]).mean(axis=0)
         top_idx = np.argsort(mean_abs)[::-1][:10]
         for rank, j in enumerate(top_idx, start=1):
-            recs.append({"Drug": drug, "Rank": rank, "Feature": X_shap.columns[j], "Mean|SHAP|": float(mean_abs[j])})
+            recs.append({
+                "Drug": drug,
+                "Rank": rank,
+                "Feature": X_shap.columns[j],
+                "Mean|SHAP|": float(np.asarray(mean_abs[j]).reshape(-1)[0]),
+            })
     pd.DataFrame(recs).to_csv(OUT_DIR/"task4a_top10_features_per_drug.csv", index=False)
 
     # (b) Least-error pair: compute prediction errors and take min absolute error
+    # Task 4b zooms in on the best-predicted (lowest error) drug–cell-line combination.
     preds = best_reg_model.predict(X)
     errors = np.abs(preds - y.values)
     idx_min = int(np.argmin(errors))
@@ -457,43 +630,56 @@ def shap_task4(best_reg_model: Pipeline, X: pd.DataFrame, y: pd.Series, keys: pd
         "Rank": np.arange(1, 11),
         "Feature": X.columns[top_idx],
         "Absolute_SHAP": mean_abs[top_idx].astype(float)
-    }).to_csv(OUT_DIR/f"task4b_top10_features_least_error_{least_key.replace('|','_')}.csv", index=False)
+    }).to_csv(
+        OUT_DIR / f"task4b_top10_features_least_error_{least_key.replace('|','_')}.csv",
+        index=False,
+    )
 
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    print("=== HW3 Runner ===")
+    log("=== HW3 Runner ===")
 
     # ---- Tasks 1–2 (Classification) ----
-    if os.path.exists(CANCER_CSV):
-        print("[Task 1] Loading cancer CSV (memory-optimized)...")
-        Xc, yc, ids, target_col, id_col = memory_savvy_read_cancers(CANCER_CSV, MAX_FEATURES_CLASSIF)
-        print(f"[Task 1] Loaded: rows={len(Xc)}, features={Xc.shape[1]}, target={target_col}, id={id_col}")
+    cancer_path = resolve_data_path(CANCER_CSV, CANCER_FALLBACK)
+    if cancer_path is not None:
+        log(f"[Task 1] Loading classification data from {cancer_path} (memory-optimized)...")
+        Xc, yc, ids, target_col, id_col = memory_savvy_read_cancers(str(cancer_path), MAX_FEATURES_CLASSIF)
+        log(f"[Task 1] Loaded: rows={len(Xc)}, features={Xc.shape[1]}, target={target_col}, id={id_col}")
         res_cls, fitted_cls, idx_to_class = train_compare_classifiers(Xc, yc, RANDOM_STATE)
         best_cls_name = res_cls.iloc[0]["Model"]
         best_cls = fitted_cls[best_cls_name]
-        print(f"[Task 1] Best classifier: {best_cls_name}")
+        log(f"[Task 1] Best classifier: {best_cls_name}")
         if HAVE_SHAP:
-            print("[Task 2] Running SHAP for best classifier...")
-            shap_task2(best_cls, Xc, yc, ids, PATIENT_ID_TO_PLOT, idx_to_class)
+            try:
+                shap_task2(best_cls, Xc, yc, ids, PATIENT_ID_TO_PLOT, idx_to_class)
+            except MemoryError:
+                log("[Task 2] SHAP ran out of memory — consider lowering SHAP_SAMPLES_PER_CLASS or MAX_FEATURES_CLASSIF.")
+            finally:
+                gc.collect()
         else:
-            print("[Task 2] shap not installed — skipping.")
+            log("[Task 2] shap not installed — skipping.")
     else:
-        print(f"[Task 1-2] Missing {CANCER_CSV}. Put it next to this script.")
+        log(f"[Task 1-2] Missing classification CSV. Checked {CANCER_CSV} and {CANCER_FALLBACK}.")
 
     # ---- Tasks 3–4 (Regression) ----
-    if os.path.exists(GDSC2_CSV):
-        print("[Task 3] Loading GDSC2 CSV (memory-optimized)...")
-        Xr, yr, keys, meta = memory_savvy_read_gdsc2(GDSC2_CSV, MAX_FEATURES_REGRESS)
-        print(f"[Task 3] Loaded: rows={meta['n_rows']}, features={meta['n_features']} (target={meta['target']}, ids={meta['id_cols']})")
+    regression_path = resolve_data_path(GDSC2_CSV, GDSC2_FALLBACK)
+    if regression_path is not None:
+        log(f"[Task 3] Loading GDSC2 CSV from {regression_path} (memory-optimized)...")
+        Xr, yr, keys, meta = memory_savvy_read_gdsc2(str(regression_path), MAX_FEATURES_REGRESS)
+        log(f"[Task 3] Loaded: rows={meta['n_rows']}, features={meta['n_features']} (target={meta['target']}, ids={meta['id_cols']})")
         res_reg, fitted_reg = train_compare_regressors(Xr, yr, RANDOM_STATE)
         best_reg_name = res_reg.iloc[0]["Model"]
         best_reg = fitted_reg[best_reg_name]
-        print(f"[Task 3] Best regressor: {best_reg_name}")
+        log(f"[Task 3] Best regressor: {best_reg_name}")
         if HAVE_SHAP:
-            print("[Task 4] Running SHAP for best regressor...")
-            shap_task4(best_reg, Xr, yr, keys)
+            try:
+                shap_task4(best_reg, Xr, yr, keys)
+            except MemoryError:
+                log("[Task 4] SHAP ran out of memory — lower SHAP_SAMPLES_REG or MAX_FEATURES_REGRESS.")
+            finally:
+                gc.collect()
         else:
-            print("[Task 4] shap not installed — skipping.")
+            log("[Task 4] shap not installed — skipping.")
     else:
-        print(f"[Task 3-4] Missing {GDSC2_CSV}. Provide it locally to run.")
+        log(f"[Task 3-4] Missing regression CSV. Checked {GDSC2_CSV} and {GDSC2_FALLBACK}.")
