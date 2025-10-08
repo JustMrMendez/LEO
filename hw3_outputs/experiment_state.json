@@ -1,0 +1,56 @@
+{
+  "Task 1: data load": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:46",
+    "metrics": {
+      "seconds": 0.061159958015196025,
+      "delta_gb": 0.00311279296875
+    }
+  },
+  "Task 1: model comparison": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:46",
+    "metrics": {
+      "seconds": 0.024305249971803278,
+      "delta_gb": 0.0042877197265625
+    }
+  },
+  "Task 2: classifier SHAP": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:46",
+    "metrics": {
+      "seconds": 0.17442491702968255,
+      "delta_gb": 0.00567626953125
+    }
+  },
+  "Task 3: data load": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:46",
+    "metrics": {
+      "seconds": 0.11677354201674461,
+      "delta_gb": 1.52587890625e-05
+    }
+  },
+  "Task 3: regressor comparison": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:46",
+    "metrics": {
+      "seconds": 0.0051003750413656235,
+      "delta_gb": 7.62939453125e-05
+    }
+  },
+  "Task 4: regressor SHAP": {
+    "status": "completed",
+    "started_at": "2025-10-08 18:43:46",
+    "completed_at": "2025-10-08 18:43:47",
+    "metrics": {
+      "seconds": 0.3066137499990873,
+      "delta_gb": 0.0522918701171875
+    }
+  }
+}
